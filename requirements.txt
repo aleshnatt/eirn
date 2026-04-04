@@ -1,0 +1,4 @@
+# Eirn-ZK: Zero-Knowledge Authentication for Post-Quantum AKE
+# Minimal dependencies — uses Python stdlib for crypto primitives
+
+pytest>=7.0
