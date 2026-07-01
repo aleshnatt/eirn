@@ -1,0 +1,25 @@
+[package]
+name = "eirn-kcp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Naufal Ziyaadaturrahman"]
+description = "Rust implementation of Eirn-KCP key consistency proofs and KEM-ratchet protocol scaffolding"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/aleshnatt/eirn"
+keywords = ["post-quantum", "kem", "zero-knowledge", "ake", "ratchet"]
+categories = ["cryptography"]
+exclude = [
+    ".DS_Store",
+    "paper/**",
+    "paper.sh",
+]
+
+[dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha3 = "0.10"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+rand = "0.8"

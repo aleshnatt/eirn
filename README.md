@@ -1,102 +1,58 @@
-# Eirn-KCP: Continuous Identity Binding via Lattice-Native Zero-Knowledge Proofs for Post-Quantum AKE
+# Eirn-KCP
 
-> **Cryptographic Construction, Protocol Extension, and Formal Security Analysis** — Extending Eirn-AKE to eliminate out-of-band Trust-On-First-Use (TOFU) verification natively.
+Rust implementation of Eirn-KCP protocol components:
 
-## Overview
+- Eirn KEM simulation with FO-style implicit rejection
+- KCP-Lite key consistency proof
+- NAXOS-derived encapsulation coins
+- Prekey bundle generation and one-time prekey consumption
+- Transcript-bound session and message KDFs
+- MSG0' sender and receiver handshake helpers
 
-Eirn-AKE is a pure-lattice asynchronous Authenticated Key Exchange protocol built over Module-LWE, securely exchanging keys via NAXOS-KEM. However, it relies heavily on out-of-band (OOB) identity verification to defend against malicious directory servers performing key substitution attacks.
+This crate is the canonical Rust library implementation for the current
+prototype.
 
-**Eirn-KCP** solves this limitation by integrating a \textit{Key Consistency Proof (KCP)} directly into the handshake and continuous session epochs. The protocol is structured as a dual-mode cipher suite to accommodate diverse network constraints:
+## Install
 
-1. **Eirn-KCP-Hash**: A lightweight 96-byte hash-based consistency proof. It acts as a highly efficient fail-fast filter, granting \textbf{wrong-key soundness} against generic substitution attacks prior to demanding heavy NTT matrix decapsulations. 
-2. **Eirn-KCP-Lattice**: A full $\sim 1.3$ KB Lattice-Native Zero-Knowledge Proof of Knowledge (ZKPoK). Constructed natively over the Module-LWE relationship via Lyubashevsky's Rejection Sampling, it yields strict Structural Witness Extraction and Honest-Verifier Zero-Knowledge (HVZK) against highly active adversarial forging.
-
-### Feature Comparison
-
-| Feature | Base Eirn-AKE | Eirn-KCP-Hash | Eirn-KCP-Lattice |
-|---------|---------------|----------|------------|
-| Authentication | NAXOS-KEM (implicit) | Hash-based Consistency| Lattice ZKPoK |
-| Identity Verification | Out-of-band (TOFU) | In-band | In-band, strictly formal |
-| Proof Construct | None | Fiat-Shamir Simulation | MLWE Rejection Sampling |
-| Data Overhead | None | + 96 Bytes | + $\sim 1.3$ KB |
-| DoS System Resilience | 4× Decaps to fail | 1× SHA3 check (fail-fast)| Fast linear polynomial check|
-
-## Eirn-Ratchet: Continuous Epoch Bindings
-
-Authenticating the initial handshake is insufficient for enduring persistent post-compromise security contexts. **Eirn-Ratchet** seamlessly ties the Eirn-KCP authentication layer continuously into the session lifecycle. 
-
-By natively mapping the Hash or Lattice Zero-Knowledge proofs directly onto ratchet epoch shifts, the sender explicitly forces transient ephemerals to mathematically trace securely backwards to the root identity. This systematically defeats \textit{Key Compromise Impersonation (KCI)} and asymmetric session-hijacking threat vectors out of the box without requiring expensive continuous Ed25519 signature generations.
-
-## Protocol Architecture & Flow
-
-```text
-Alice (Sender)                                Bob (Receiver)
-─────────────────                             ──────────────────
-1. (ek_A, esk_A) ← KeyGen()
-2. ct1..ct3 ← Encapsulations
-3. ct4 ← NAXOS.Encaps(spk_B, sk_A, esk_A)
------------------------------
-4a. Hash Mode: π ← Hash.Prove(sk_A, ctx)
-4b. Lattice Mode: π ← LatticeZK.Prove(Lattice_sk, ctx)
-
-               MSG0' = (pk_A, ek_A, ct1..ct4, π_KCP)
-               ─────────────────────────────────────────────►
-
-                                          1. Verify(pk_A, ctx, π_KCP) 
-                                             (abort if invalid — fail-fast)
-                                          2. K1..K4 ← Decaps(ct1..ct4)
-                                          3. ss ← KDF(K1‖K2‖K3‖K4‖...)
+```toml
+[dependencies]
+eirn-kcp = "0.1"
 ```
 
-## Project Structure
+## Example
 
-```text
-eirn-zk/
-├── eirn_kem/          # Simulated MLWE-KEM core
-│   ├── kem.py         # KeyGen, Encaps, Decaps
-│   └── params.py      # Core parameters (Eirn-512, Eirn-768)
-├── naxos_kem/         # NAXOS-KEM (eCK-secure auth primitive)
-├── lattice_zk/        # Lattice-Native ZK module
-│   └── prover.py      # Lyubashevsky MLWE rejection sampling
-├── zk/                # Hash-commitment module
-├── ratchet/           # Eirn-Ratchet: Continuous Epoch Binding
-├── protocol/          # Eirn-KCP orchestration logic
-│   ├── handshake.py   # Dual-mode MSG0' construction & verification
-│   └── session.py     # Session key derivation
-├── tests/             # Pytest framework (55 Tests passing)
-├── whitepaper/        # LaTeX research paper & mathematical boundaries
-├── main.py            # Executable protocol simulation
-├── pytest.ini         # Pytest rendering configuration
-├── conftest.py        # Terminal formatting hooks
-└── README.md          # Project documentation
+```rust
+use eirn_kcp::{generate_prekey_bundle, keygen, receiver_handshake, sender_handshake};
+
+let (alice_pk, alice_sk) = keygen();
+let mut bob_bundle = generate_prekey_bundle(10);
+
+let (msg0, alice_session_key) = sender_handshake(&alice_sk, &alice_pk, &bob_bundle)?;
+let bob_session_key = receiver_handshake(&mut bob_bundle, &msg0)?;
+
+assert_eq!(alice_session_key, bob_session_key);
+# Ok::<(), eirn_kcp::EirnError>(())
 ```
 
-## Quick Start
+## Security Status
+
+This crate is suitable for protocol experimentation and integration tests. The
+KEM is a hash-based simulation that preserves the intended interface, not an
+audited MLWE KEM. KCP-Lite provides context-bound wrong-key detection for the
+prototype threat model; strict lattice ZKPoK mode is not implemented in this
+release and returns an explicit error instead of panicking.
+
+Do not use this crate as a production cryptographic primitive without replacing
+the simulated KEM and proof layer with audited implementations.
+
+## Development
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the complete protocol simulation
-python3 main.py
-
-# Execute the test suite
-python3 -m pytest tests/
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo package --allow-dirty --list
 ```
 
-## Zero-Knowledge Mathematics (Lattice Mode)
-
-To extract full formal boundaries natively from the MLWE relationship $\mathbf{t} = \mathbf{A}\mathbf{s} + \mathbf{e} \bmod q$:
-* **Rejection Sampling**: The verifier constructs an interactive mathematical query $\mathbf{z} = \mathbf{y} + c\mathbf{s}$ mapped aggressively over bounded uniform geometrical intervals $[-\gamma_1, \gamma_1]$. The prover geometrically aborts internally to erase any biased algebraic drift.
-* **Formal Extractor Yield**: If the interaction successfully produces identical challenge commitments, an active extractor theoretically manipulates $(c - c')^{-1} (\mathbf{z} - \mathbf{z}')$ to mathematically expose underlying identity keys cleanly without solving generic shortest vector thresholds globally.
-
-## Limitations
-
-- **Research prototype**: Not audited for active production pipelines structurally. 
-- **Math Abstractions**: Evaluates generic python geometric simulations; operates unverified against modern constant-time side-channel metrics natively. 
-
-## References
-Please check the `/whitepaper` output for full formal constraints referencing standard properties by Lyubashevsky (2012), K-Waay models (2024), and original Fujisaki-Okamoto bounds.
-
 ## License
-Eirn-KCP Dual-Mode Prototype. Distributed under standard academic research disclosures.
+
+MIT

@@ -1,2 +1,4 @@
 paper/
 *.sh
+target/
+.DS_Store
