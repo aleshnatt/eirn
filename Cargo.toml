@@ -2,7 +2,7 @@
 name = "eirn-kcp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
 authors = ["Naufal Ziyaadaturrahman <naufal@aleshnatt.com>"]
 description = "Protocol model for the Eirn-KCP asynchronous key exchange design"
 documentation = "https://docs.rs/eirn-kcp"
@@ -22,7 +22,8 @@ exclude = [
 ]
 
 [dependencies]
-ed25519-dalek = "2.1"
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
+ml-kem = { version = "0.3.2", features = ["getrandom", "hazmat", "zeroize"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha3 = "0.10"
 subtle = "2.6"

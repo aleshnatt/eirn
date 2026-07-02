@@ -1,6 +1,8 @@
 use eirn_kcp::{
-    decaps, encaps, encaps_deterministic, generate_prekey_bundle, keygen, receiver_handshake,
-    sender_handshake, KcpLiteProof, Msg0Prime, PublicKey,
+    decaps, encaps, encaps_deterministic, generate_prekey_bundle,
+    generate_prekey_bundle_with_params, keygen, keygen_with_params, receiver_handshake,
+    sender_handshake, sender_handshake_strict, KcpLiteProof, KcpMode, KcpStrictProof, Msg0Prime,
+    PublicKey, PARAMS_1024,
 };
 use sha3::{Digest, Sha3_256};
 
@@ -19,6 +21,16 @@ fn kem_wrong_key_rejects() {
     let (ct, ss_enc) = encaps(&pk);
     let ss_wrong = decaps(&wrong_sk, &ct);
     assert_ne!(ss_enc, ss_wrong);
+}
+
+#[test]
+fn ml_kem_1024_roundtrip_matches() {
+    let (pk, sk) = keygen_with_params(PARAMS_1024);
+    let (ct, ss_enc) = encaps(&pk);
+    let ss_dec = decaps(&sk, &ct);
+    assert_eq!(ss_enc, ss_dec);
+    assert_eq!(pk.as_bytes().len(), PARAMS_1024.pk_bytes);
+    assert_eq!(ct.as_bytes().len(), PARAMS_1024.ct_bytes);
 }
 
 #[test]
@@ -96,8 +108,8 @@ fn kcp_lite_rejects_forged_proof() {
 
     let mut forged = eirn_kcp::kcp_lite_prove(&sk_a, pk_a.as_bytes(), &ctx).unwrap();
     // invalid signature bytes with a recomputed anchor
-    forged.response = [9u8; 64];
-    forged.anchor = kcp_lite_anchor(pk_a.as_bytes(), &forged.response, &ctx);
+    forged.response = vec![9u8; forged.response.len()];
+    forged.anchor = kcp_lite_anchor(&forged.commitment, &forged.response, &ctx);
 
     assert!(!eirn_kcp::kcp_lite_verify(pk_a.as_bytes(), &ctx, &forged));
 }
@@ -118,6 +130,38 @@ fn kcp_lite_rejects_wrong_context() {
         &other_ctx,
         &proof
     ));
+}
+
+#[test]
+fn kcp_strict_proof_roundtrips_and_verifies() {
+    let (pk_a, sk_a) = keygen();
+    let (pk_b, _) = keygen();
+    let (ek_a, _) = keygen();
+    let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
+
+    let proof = eirn_kcp::kcp_strict_prove(&sk_a, &pk_a, &ctx).unwrap();
+    assert!(eirn_kcp::kcp_strict_verify(&pk_a, &ctx, &proof));
+
+    let encoded = proof.to_bytes();
+    let decoded = KcpStrictProof::from_bytes(&encoded).unwrap();
+    assert_eq!(proof, decoded);
+}
+
+#[test]
+fn kcp_strict_rejects_tampering_and_replay() {
+    let (pk_a, sk_a) = keygen();
+    let (pk_b, _) = keygen();
+    let (ek_a, _) = keygen();
+    let (ek_other, _) = keygen();
+    let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
+    let other_ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_other);
+
+    let proof = eirn_kcp::kcp_strict_prove(&sk_a, &pk_a, &ctx).unwrap();
+    assert!(!eirn_kcp::kcp_strict_verify(&pk_a, &other_ctx, &proof));
+
+    let mut tampered = proof.clone();
+    tampered.response[0] ^= 1;
+    assert!(!eirn_kcp::kcp_strict_verify(&pk_a, &ctx, &tampered));
 }
 
 #[test]
@@ -146,6 +190,81 @@ fn msg0_prime_roundtrips_through_bytes() {
     let decoded = Msg0Prime::from_bytes(&encoded).unwrap();
     assert_eq!(decoded.total_size(), Msg0Prime::SIZE);
     assert_eq!(decoded.to_bytes(), encoded);
+
+    let bob_ss = receiver_handshake(&mut bundle_b, &decoded).unwrap();
+    assert_eq!(alice_ss, bob_ss);
+}
+
+#[test]
+fn strict_handshake_produces_matching_session_keys() {
+    let (pk_a, sk_a) = keygen();
+    let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
+
+    let (msg0, alice_ss) = sender_handshake_strict(&sk_a, &pk_a, &public_bundle_b).unwrap();
+    assert_eq!(msg0.kcp_mode, KcpMode::Strict);
+    assert!(msg0.kcp_strict_proof.is_some());
+    let bob_ss = receiver_handshake(&mut bundle_b, &msg0).unwrap();
+
+    assert_eq!(alice_ss, bob_ss);
+}
+
+#[test]
+fn strict_msg0_prime_roundtrips_through_bytes() {
+    let (pk_a, sk_a) = keygen();
+    let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
+
+    let (msg0, alice_ss) = sender_handshake_strict(&sk_a, &pk_a, &public_bundle_b).unwrap();
+    let encoded = msg0.to_bytes();
+    assert_eq!(encoded.len(), msg0.total_size());
+
+    let decoded = Msg0Prime::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded.kcp_mode, KcpMode::Strict);
+    assert_eq!(decoded.to_bytes(), encoded);
+
+    let bob_ss = receiver_handshake(&mut bundle_b, &decoded).unwrap();
+    assert_eq!(alice_ss, bob_ss);
+}
+
+#[test]
+fn ml_kem_1024_handshake_roundtrips_through_bytes() {
+    let (pk_a, sk_a) = keygen_with_params(PARAMS_1024);
+    let mut bundle_b = generate_prekey_bundle_with_params(3, PARAMS_1024);
+    let public_bundle_b = bundle_b.public_bundle();
+
+    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &public_bundle_b).unwrap();
+    let encoded = msg0.to_bytes();
+    assert_eq!(encoded.len(), msg0.total_size());
+    assert_eq!(
+        encoded.len(),
+        1 + PARAMS_1024.pk_bytes * 2 + PARAMS_1024.ct_bytes * 4 + PARAMS_1024.proof_bytes
+    );
+
+    let decoded = Msg0Prime::from_bytes_with_params(&encoded, PARAMS_1024).unwrap();
+    assert_eq!(decoded.total_size(), encoded.len());
+    assert_eq!(decoded.to_bytes(), encoded);
+
+    let bob_ss = receiver_handshake(&mut bundle_b, &decoded).unwrap();
+    assert_eq!(alice_ss, bob_ss);
+}
+
+#[test]
+fn strict_ml_kem_1024_handshake_roundtrips_through_bytes() {
+    let (pk_a, sk_a) = keygen_with_params(PARAMS_1024);
+    let mut bundle_b = generate_prekey_bundle_with_params(3, PARAMS_1024);
+    let public_bundle_b = bundle_b.public_bundle();
+
+    let (msg0, alice_ss) = sender_handshake_strict(&sk_a, &pk_a, &public_bundle_b).unwrap();
+    let encoded = msg0.to_bytes();
+    assert_eq!(encoded.len(), msg0.total_size());
+    assert_eq!(
+        encoded.len(),
+        1 + PARAMS_1024.pk_bytes * 2 + PARAMS_1024.ct_bytes * 4 + PARAMS_1024.strict_proof_bytes
+    );
+
+    let decoded = Msg0Prime::from_bytes_with_params(&encoded, PARAMS_1024).unwrap();
+    assert_eq!(decoded.kcp_mode, KcpMode::Strict);
 
     let bob_ss = receiver_handshake(&mut bundle_b, &decoded).unwrap();
     assert_eq!(alice_ss, bob_ss);
@@ -210,10 +329,10 @@ fn debug_output_redacts_secret_material() {
     assert!(bundle_debug.contains("<redacted>"));
 }
 
-fn kcp_lite_anchor(pk: &[u8; 32], response: &[u8; 64], ctx: &[u8]) -> [u8; 32] {
+fn kcp_lite_anchor(commitment: &[u8; 32], response: &[u8], ctx: &[u8]) -> [u8; 32] {
     let mut hasher = Sha3_256::new();
     hasher.update(b"eirn-kcp-lite-anchor-v1");
-    hasher.update(pk);
+    hasher.update(commitment);
     hasher.update(response);
     hasher.update(ctx);
     hasher.finalize().into()

@@ -1,100 +1,94 @@
-//! Hash-based KEM-like building blocks for Eirn-KCP.
+//! ML-KEM key encapsulation building blocks for Eirn-KCP.
 //!
-//! This module implements fixed-size key generation, encapsulation, and
-//! decapsulation used by the handshake. It is designed to bind ciphertexts to a
-//! recipient public key and return deterministic rejection secrets for malformed
-//! ciphertexts. It does not implement a standardized post-quantum KEM, and its
-//! side-channel and reduction properties require independent review.
+//! This module wraps the FIPS 203 ML-KEM implementations used by the handshake.
+//! Public keys carry the ML-KEM encapsulation key, the ML-DSA verifying key used
+//! by KCP-Lite, and the lattice statement used by KCP-Strict, so a single
+//! authenticated Eirn public key binds key establishment and proof verification.
 
 use core::fmt;
 
-use ed25519_dalek::SigningKey;
+use ml_dsa::{
+    Keypair as _, MlDsa65, MlDsa87, SignatureEncoding as _, Signer, SigningKey as MlDsaSigningKey,
+};
+use ml_kem::{
+    kem::{Decapsulate, KeyExport},
+    DecapsulationKey1024, DecapsulationKey768, EncapsulationKey1024, EncapsulationKey768,
+    MlKem1024, MlKem768, Seed as MlKemSeed,
+};
 use rand_core::{CryptoRng, OsRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::{
     error::{EirnError, Result},
-    params::{EirnParams, PARAMS_512},
-    util::{ct_eq, sha3_256, shake256},
+    lattice_zk,
+    params::{EirnParams, PARAMS_1024, PARAMS_768},
+    util::{ct_eq, sha3_256},
 };
 
-/// Public encapsulation key for an Eirn-KCP profile.
+type MlKemCiphertext768 = ml_kem::Ciphertext<MlKem768>;
+type MlKemCiphertext1024 = ml_kem::Ciphertext<MlKem1024>;
+type MlDsaSeed = ml_dsa::Seed;
+
+/// Public Eirn-KCP key material for a post-quantum profile.
 ///
-/// The key identifies the recipient in KEM and handshake transcripts. Equality
-/// and byte conversion preserve the attached parameter profile so callers can
-/// avoid mixing incompatible protocol profiles. Callers must obtain public keys
-/// from authenticated bundle metadata before trusting a derived session.
+/// The encoded key is
+/// `ML-KEM public key || ML-DSA verifying key || lattice statement`.
+/// Applications must authenticate these bytes before accepting them as a peer
+/// identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicKey {
-    data: [u8; 32],
+    data: Vec<u8>,
     params: EirnParams,
 }
 
 impl PublicKey {
-    /// Fixed encoded public-key size in bytes.
-    pub const SIZE: usize = 32;
+    /// Fixed encoded public-key size in bytes for the default profile.
+    pub const SIZE: usize = 3200;
 
-    /// Returns the canonical fixed-size public-key encoding.
-    ///
-    /// # Security
-    ///
-    /// The returned bytes identify the key in transcript binding. Callers must
-    /// authenticate the source of these bytes before using them as a peer
-    /// identity.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    /// Returns the canonical public-key encoding.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
     /// Parses a public key from its fixed-size byte encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EirnError::InvalidKeyLength`] if `data` is not exactly
-    /// [`PublicKey::SIZE`] bytes.
-    ///
-    /// # Untrusted Input
-    ///
-    /// This function accepts data from untrusted sources. All structural checks
-    /// are performed before any arithmetic. Malformed input is rejected with an
-    /// error rather than panicking.
-    ///
-    /// # Security
-    ///
-    /// Parsing does not authenticate the key. Callers must bind the returned key
-    /// to an authenticated identity or trusted prekey bundle.
     pub fn from_bytes(data: &[u8], params: EirnParams) -> Result<Self> {
-        let bytes: [u8; Self::SIZE] = data.try_into().map_err(|_| EirnError::InvalidKeyLength {
-            expected: Self::SIZE,
-            actual: data.len(),
-        })?;
+        ensure_supported_params(params)?;
+        if data.len() != params.pk_bytes {
+            return Err(EirnError::InvalidKeyLength {
+                expected: params.pk_bytes,
+                actual: data.len(),
+            });
+        }
+
+        parse_encapsulation_key(data, params)?;
+        parse_verifying_key(
+            &data[params.kem_pk_bytes..params.kem_pk_bytes + params.sig_pk_bytes],
+            params,
+        )?;
+        parse_lattice_statement(data, params)?;
+
         Ok(Self {
-            data: bytes,
+            data: data.to_vec(),
             params,
         })
     }
 
     /// Returns the protocol profile attached to this key.
-    ///
-    /// # Security
-    ///
-    /// Parameter equality is used to prevent accidental cross-profile use.
-    /// Callers must still choose profiles appropriate for their deployment.
     pub fn params(&self) -> EirnParams {
         self.params
     }
 }
 
-/// Secret encapsulation key for an Eirn-KCP profile.
+/// Secret Eirn-KCP key material for a post-quantum profile.
 ///
-/// The key owns the seed used for decapsulation and KCP-Lite proof generation.
-/// Its debug representation redacts the seed, and the seed is zeroized on drop.
-/// Callers must keep values of this type private and avoid cloning them beyond
-/// the lifetime needed for a handshake.
+/// The key owns an ML-KEM decapsulation seed and an ML-DSA signing seed. Its
+/// debug representation redacts both seeds.
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct SecretKey {
-    seed: [u8; 32],
-    pk_data: [u8; 32],
+    kem_seed: [u8; 64],
+    sig_seed: [u8; 32],
+    pk_data: Vec<u8>,
     #[zeroize(skip)]
     params: EirnParams,
 }
@@ -102,7 +96,8 @@ pub struct SecretKey {
 impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretKey")
-            .field("seed", &"<redacted>")
+            .field("kem_seed", &"<redacted>")
+            .field("sig_seed", &"<redacted>")
             .field("pk_data", &self.pk_data)
             .field("params", &self.params)
             .finish()
@@ -110,177 +105,161 @@ impl fmt::Debug for SecretKey {
 }
 
 impl SecretKey {
-    pub(crate) fn seed(&self) -> &[u8; 32] {
-        &self.seed
+    pub(crate) fn commitment_secret(&self) -> [u8; 32] {
+        let mut input = Vec::with_capacity(self.kem_seed.len() + self.sig_seed.len());
+        input.extend_from_slice(&self.kem_seed);
+        input.extend_from_slice(&self.sig_seed);
+        sha3_256(&input)
+    }
+
+    pub(crate) fn sign_proof_message(&self, message: &[u8]) -> Vec<u8> {
+        match self.params {
+            PARAMS_768 => MlDsaSigningKey::<MlDsa65>::from_seed(&MlDsaSeed::from(self.sig_seed))
+                .sign(message)
+                .to_bytes()
+                .to_vec(),
+            PARAMS_1024 => MlDsaSigningKey::<MlDsa87>::from_seed(&MlDsaSeed::from(self.sig_seed))
+                .sign(message)
+                .to_bytes()
+                .to_vec(),
+            _ => unreachable!("SecretKey construction rejects unsupported params"),
+        }
+    }
+
+    pub(crate) fn strict_witness(&self) -> [i16; lattice_zk::WITNESS_DIM] {
+        lattice_zk::derive_witness(&self.kem_seed, &self.sig_seed)
+    }
+
+    pub(crate) fn strict_public_seed(&self) -> &[u8] {
+        lattice_zk::public_seed_from_key(
+            &self.pk_data,
+            self.params.kem_pk_bytes,
+            self.params.sig_pk_bytes,
+        )
     }
 
     /// Returns the public key bytes derived from this secret key.
-    ///
-    /// # Security
-    ///
-    /// These bytes are safe to publish, but callers must not treat publication
-    /// as proof that the peer controls the secret key. Use KCP-Lite proof
-    /// verification or authenticated bundle metadata for that binding.
-    pub fn public_key_bytes(&self) -> &[u8; 32] {
+    pub fn public_key_bytes(&self) -> &[u8] {
         &self.pk_data
     }
 
     /// Returns the protocol profile attached to this key.
-    ///
-    /// # Security
-    ///
-    /// Parameter equality helps reject accidental profile mixing. It does not
-    /// validate that the profile is strong enough for a deployment.
     pub fn params(&self) -> EirnParams {
         self.params
     }
 
     /// Checks whether this secret key owns the supplied public key.
-    ///
-    /// # Timing
-    ///
-    /// The byte comparison is performed with `subtle` constant-time equality.
-    ///
-    /// # Security
-    ///
-    /// A `true` result only proves local key-pair consistency. Callers must not
-    /// use it as peer authentication.
     pub fn matches_public_key(&self, pk: &PublicKey) -> bool {
         self.params == pk.params && ct_eq(&self.pk_data, pk.as_bytes())
     }
 }
 
-/// Fixed-size encapsulation ciphertext.
-///
-/// The ciphertext carries the nonce and masked coins needed by the recipient to
-/// derive the same shared secret. Decapsulation uses deterministic rejection
-/// when the nonce check fails. Callers must include ciphertext bytes in the
-/// session transcript so substitution changes the derived session key.
+/// Fixed-size ML-KEM encapsulation ciphertext.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ciphertext {
-    data: [u8; 64],
+    data: Vec<u8>,
     params: EirnParams,
 }
 
 impl Ciphertext {
-    /// Fixed encoded ciphertext size in bytes.
-    pub const SIZE: usize = 64;
+    /// Fixed encoded ciphertext size in bytes for the default profile.
+    pub const SIZE: usize = 1088;
 
-    /// Returns the canonical fixed-size ciphertext encoding.
-    ///
-    /// # Security
-    ///
-    /// These bytes must be transcript-bound by higher-level protocols. A
-    /// ciphertext alone does not authenticate the sender.
-    pub fn as_bytes(&self) -> &[u8; 64] {
+    /// Returns the canonical ciphertext encoding.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
     /// Parses a ciphertext from its fixed-size byte encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EirnError::InvalidCiphertextLength`] if `data` is not exactly
-    /// [`Ciphertext::SIZE`] bytes.
-    ///
-    /// # Untrusted Input
-    ///
-    /// This function accepts data from untrusted sources. All structural checks
-    /// are performed before any arithmetic. Malformed input is rejected with an
-    /// error rather than panicking.
-    ///
-    /// # Security
-    ///
-    /// Parsing does not validate that the ciphertext was produced for a
-    /// particular recipient. Callers must decapsulate with the intended secret
-    /// key and bind the ciphertext bytes into the transcript.
     pub fn from_bytes(data: &[u8], params: EirnParams) -> Result<Self> {
-        let bytes: [u8; Self::SIZE] =
-            data.try_into()
-                .map_err(|_| EirnError::InvalidCiphertextLength {
-                    expected: Self::SIZE,
-                    actual: data.len(),
-                })?;
+        ensure_supported_params(params)?;
+        if data.len() != params.ct_bytes {
+            return Err(EirnError::InvalidCiphertextLength {
+                expected: params.ct_bytes,
+                actual: data.len(),
+            });
+        }
+        parse_ciphertext(data, params)?;
         Ok(Self {
-            data: bytes,
+            data: data.to_vec(),
             params,
         })
     }
 
     /// Returns the protocol profile attached to this ciphertext.
-    ///
-    /// # Security
-    ///
-    /// Callers should reject profile mismatches before combining ciphertexts
-    /// with keys from a different profile.
     pub fn params(&self) -> EirnParams {
         self.params
     }
 }
 
-/// Generates a key pair under the default Eirn-512 profile.
-///
-/// # Randomness
-///
-/// This function uses `OsRng` as a cryptographically secure pseudorandom number
-/// generator. A platform RNG failure will abort inside the RNG provider.
+/// Generates a key pair under the default ML-KEM-768 / ML-DSA-65 profile.
 pub fn keygen() -> (PublicKey, SecretKey) {
-    keygen_with_rng(&mut OsRng, PARAMS_512)
+    keygen_with_rng(&mut OsRng, PARAMS_768)
 }
 
 /// Generates a key pair under `params` using the operating-system RNG.
-///
-/// # Randomness
-///
-/// This function uses `OsRng` as a cryptographically secure pseudorandom number
-/// generator. A platform RNG failure will abort inside the RNG provider.
-///
-/// # Security
-///
-/// The selected parameters are stored with both keys. Callers must choose a
-/// profile that matches every peer and ciphertext in the protocol run.
 pub fn keygen_with_params(params: EirnParams) -> (PublicKey, SecretKey) {
     keygen_with_rng(&mut OsRng, params)
 }
 
 /// Generates a key pair under `params` using caller-supplied randomness.
-///
-/// # Randomness
-///
-/// The `rng` parameter must be a cryptographically secure pseudorandom number
-/// generator. Passing a weak or deterministic RNG breaks the security of the
-/// output.
-///
-/// # Security
-///
-/// The generated secret key seed must remain private. Test-only deterministic
-/// RNGs must never be used for real protocol keys.
 pub fn keygen_with_rng<R: RngCore + CryptoRng>(
     rng: &mut R,
     params: EirnParams,
 ) -> (PublicKey, SecretKey) {
-    let mut secret_seed = [0u8; 32];
-    rng.fill_bytes(&mut secret_seed);
-    keygen_from_seed(secret_seed, params)
+    let mut seed = [0u8; 96];
+    rng.fill_bytes(&mut seed);
+    keygen_from_seed(seed, params)
 }
 
-/// Derives a key pair deterministically from a 32-byte seed.
+/// Derives a key pair deterministically from a 96-byte seed.
 ///
-/// # Security
-///
-/// This constructor is intended for tests and deterministic fixtures. Reusing a
-/// seed or deriving it from low-entropy input gives every holder of the seed the
-/// secret key.
-pub fn keygen_from_seed(seed: [u8; 32], params: EirnParams) -> (PublicKey, SecretKey) {
-    let signing_key = SigningKey::from_bytes(&seed);
-    let pk_data = signing_key.verifying_key().to_bytes();
+/// The first 64 bytes seed ML-KEM. The final 32 bytes seed ML-DSA.
+pub fn keygen_from_seed(seed: [u8; 96], params: EirnParams) -> (PublicKey, SecretKey) {
+    if !is_supported_params(params) {
+        panic!("unsupported Eirn-KCP parameter set: {}", params.name);
+    }
+
+    let mut kem_seed = [0u8; 64];
+    let mut sig_seed = [0u8; 32];
+    kem_seed.copy_from_slice(&seed[..64]);
+    sig_seed.copy_from_slice(&seed[64..]);
+
+    let (ek_bytes, vk_bytes) = match params {
+        PARAMS_768 => {
+            let dk = DecapsulationKey768::from_seed(MlKemSeed::from(kem_seed));
+            let sig_key = MlDsaSigningKey::<MlDsa65>::from_seed(&MlDsaSeed::from(sig_seed));
+            (
+                dk.encapsulation_key().to_bytes().to_vec(),
+                sig_key.verifying_key().to_bytes().to_vec(),
+            )
+        }
+        PARAMS_1024 => {
+            let dk = DecapsulationKey1024::from_seed(MlKemSeed::from(kem_seed));
+            let sig_key = MlDsaSigningKey::<MlDsa87>::from_seed(&MlDsaSeed::from(sig_seed));
+            (
+                dk.encapsulation_key().to_bytes().to_vec(),
+                sig_key.verifying_key().to_bytes().to_vec(),
+            )
+        }
+        _ => unreachable!("unsupported params rejected above"),
+    };
+
+    let mut pk_data = Vec::with_capacity(params.pk_bytes);
+    pk_data.extend_from_slice(&ek_bytes);
+    pk_data.extend_from_slice(&vk_bytes);
+    let witness = lattice_zk::derive_witness(&kem_seed, &sig_seed);
+    let statement = lattice_zk::statement_from_witness(&pk_data, &witness);
+    pk_data.extend_from_slice(&lattice_zk::encode_statement(&statement));
+
     (
         PublicKey {
-            data: pk_data,
+            data: pk_data.clone(),
             params,
         },
         SecretKey {
-            seed,
+            kem_seed,
+            sig_seed,
             pk_data,
             params,
         },
@@ -288,121 +267,194 @@ pub fn keygen_from_seed(seed: [u8; 32], params: EirnParams) -> (PublicKey, Secre
 }
 
 /// Encapsulates to `pk` using `OsRng`.
-///
-/// # Randomness
-///
-/// This function uses `OsRng` as a cryptographically secure pseudorandom number
-/// generator. Fresh coins are required for each encapsulation.
-///
-/// # Security
-///
-/// The returned shared secret must be fed into a transcript-bound KDF before it
-/// is used as an application key.
 pub fn encaps(pk: &PublicKey) -> (Ciphertext, [u8; 32]) {
     encaps_with_rng(&mut OsRng, pk)
 }
 
 /// Encapsulates to `pk` using caller-supplied randomness.
-///
-/// # Randomness
-///
-/// The `rng` parameter must be a cryptographically secure pseudorandom number
-/// generator. Passing a weak or deterministic RNG breaks the security of the
-/// output.
-///
-/// # Security
-///
-/// The returned shared secret is bound to the recipient public key and random
-/// coins, not to a full handshake transcript. Higher-level code must bind peer
-/// identities and ciphertext bytes before deriving session keys.
 pub fn encaps_with_rng<R: RngCore + CryptoRng>(
     rng: &mut R,
     pk: &PublicKey,
 ) -> (Ciphertext, [u8; 32]) {
-    let mut encapsulation_coins = [0u8; 32];
-    rng.fill_bytes(&mut encapsulation_coins);
-    encaps_deterministic(pk, &encapsulation_coins)
+    let mut coins = [0u8; 32];
+    rng.fill_bytes(&mut coins);
+    encaps_deterministic(pk, &coins)
 }
 
-/// Encapsulates to `pk` with explicit 32-byte coins.
+/// Encapsulates to `pk` with explicit 32-byte ML-KEM randomness.
 ///
 /// # Security
 ///
-/// This function is deterministic and should be used only when the coins are
-/// already cryptographically random or intentionally derived by a protocol such
-/// as the NAXOS path. Reusing coins for the same recipient repeats the
-/// ciphertext and shared secret.
+/// This is exposed for deterministic test vectors and protocol-internal
+/// derivations. Normal callers should use [`encaps`].
 pub fn encaps_deterministic(pk: &PublicKey, coins: &[u8; 32]) -> (Ciphertext, [u8; 32]) {
-    let mut nonce_input = Vec::with_capacity(15 + 32 + 32);
-    nonce_input.extend_from_slice(b"eirn-nonce");
-    nonce_input.extend_from_slice(pk.as_bytes());
-    nonce_input.extend_from_slice(coins);
-    let nonce = sha3_256(&nonce_input);
+    let (ct_data, shared) = match pk.params {
+        PARAMS_768 => {
+            let ek = parse_encapsulation_key_768(pk.as_bytes(), pk.params)
+                .expect("PublicKey values are validated at construction");
+            let (ct, ss) = ek.encapsulate_deterministic(&ml_kem::B32::from(*coins));
+            let ct_bytes: &[u8] = ct.as_ref();
+            let mut shared = [0u8; 32];
+            shared.copy_from_slice(&ss);
+            (ct_bytes.to_vec(), shared)
+        }
+        PARAMS_1024 => {
+            let ek = parse_encapsulation_key_1024(pk.as_bytes(), pk.params)
+                .expect("PublicKey values are validated at construction");
+            let (ct, ss) = ek.encapsulate_deterministic(&ml_kem::B32::from(*coins));
+            let ct_bytes: &[u8] = ct.as_ref();
+            let mut shared = [0u8; 32];
+            shared.copy_from_slice(&ss);
+            (ct_bytes.to_vec(), shared)
+        }
+        _ => unreachable!("PublicKey construction rejects unsupported params"),
+    };
 
-    let mut mask_input = Vec::with_capacity(12 + 32 + 32);
-    mask_input.extend_from_slice(b"eirn-fo-mask");
-    mask_input.extend_from_slice(pk.as_bytes());
-    mask_input.extend_from_slice(&nonce);
-    let mask = shake256(&mask_input, 32);
-
-    let mut data = [0u8; 64];
-    data[..32].copy_from_slice(&nonce);
-    for (dst, (coin, mask_byte)) in data[32..].iter_mut().zip(coins.iter().zip(mask.iter())) {
-        *dst = coin ^ mask_byte;
-    }
-
-    let mut ss_input = Vec::with_capacity(7 + 32 + 32);
-    ss_input.extend_from_slice(b"eirn-ss");
-    ss_input.extend_from_slice(pk.as_bytes());
-    ss_input.extend_from_slice(coins);
     (
         Ciphertext {
-            data,
+            data: ct_data,
             params: pk.params,
         },
-        sha3_256(&ss_input),
+        shared,
     )
 }
 
-/// Decapsulates a ciphertext or returns a deterministic rejection secret.
-///
-/// # Security
-///
-/// Valid ciphertexts produce the sender's shared secret. Invalid ciphertexts
-/// produce a deterministic rejection secret keyed by the recipient secret seed,
-/// so callers must not reveal which branch occurred through protocol behavior.
+/// Decapsulates an ML-KEM ciphertext.
 pub fn decaps(sk: &SecretKey, ct: &Ciphertext) -> [u8; 32] {
-    let nonce = &ct.as_bytes()[..32];
-    let encrypted = &ct.as_bytes()[32..];
-
-    let mut mask_input = Vec::with_capacity(12 + 32 + 32);
-    mask_input.extend_from_slice(b"eirn-fo-mask");
-    mask_input.extend_from_slice(sk.public_key_bytes());
-    mask_input.extend_from_slice(nonce);
-    let mask = shake256(&mask_input, encrypted.len());
-
-    let mut coins = [0u8; 32];
-    for (dst, (cipher, mask_byte)) in coins.iter_mut().zip(encrypted.iter().zip(mask.iter())) {
-        *dst = cipher ^ mask_byte;
+    let mut shared = [0u8; 32];
+    match sk.params {
+        PARAMS_768 => {
+            let dk = DecapsulationKey768::from_seed(MlKemSeed::from(sk.kem_seed));
+            let kem_ct = parse_ciphertext_768(ct.as_bytes(), ct.params)
+                .expect("Ciphertext values are validated at construction");
+            shared.copy_from_slice(&dk.decapsulate(&kem_ct));
+        }
+        PARAMS_1024 => {
+            let dk = DecapsulationKey1024::from_seed(MlKemSeed::from(sk.kem_seed));
+            let kem_ct = parse_ciphertext_1024(ct.as_bytes(), ct.params)
+                .expect("Ciphertext values are validated at construction");
+            shared.copy_from_slice(&dk.decapsulate(&kem_ct));
+        }
+        _ => unreachable!("SecretKey construction rejects unsupported params"),
     }
+    shared
+}
 
-    let mut nonce_input = Vec::with_capacity(10 + 32 + 32);
-    nonce_input.extend_from_slice(b"eirn-nonce");
-    nonce_input.extend_from_slice(sk.public_key_bytes());
-    nonce_input.extend_from_slice(&coins);
-    let nonce_check = sha3_256(&nonce_input);
-
-    if ct_eq(&nonce_check, nonce) {
-        let mut ss_input = Vec::with_capacity(7 + 32 + 32);
-        ss_input.extend_from_slice(b"eirn-ss");
-        ss_input.extend_from_slice(sk.public_key_bytes());
-        ss_input.extend_from_slice(&coins);
-        sha3_256(&ss_input)
-    } else {
-        let mut reject_input = Vec::with_capacity(11 + 32 + 64);
-        reject_input.extend_from_slice(b"eirn-reject");
-        reject_input.extend_from_slice(sk.seed());
-        reject_input.extend_from_slice(ct.as_bytes());
-        sha3_256(&reject_input)
+fn ensure_supported_params(params: EirnParams) -> Result<()> {
+    if !is_supported_params(params) {
+        return Err(EirnError::UnsupportedParameterSet { name: params.name });
     }
+    Ok(())
+}
+
+fn is_supported_params(params: EirnParams) -> bool {
+    matches!(params, PARAMS_768 | PARAMS_1024)
+}
+
+fn parse_encapsulation_key(data: &[u8], params: EirnParams) -> Result<()> {
+    match params {
+        PARAMS_768 => parse_encapsulation_key_768(data, params).map(|_| ()),
+        PARAMS_1024 => parse_encapsulation_key_1024(data, params).map(|_| ()),
+        _ => Err(EirnError::UnsupportedParameterSet { name: params.name }),
+    }
+}
+
+fn parse_encapsulation_key_768(data: &[u8], params: EirnParams) -> Result<EncapsulationKey768> {
+    let kem_bytes = data
+        .get(..params.kem_pk_bytes)
+        .ok_or(EirnError::InvalidKeyLength {
+            expected: params.pk_bytes,
+            actual: data.len(),
+        })?;
+    let encoded = ml_kem::kem::Key::<EncapsulationKey768>::try_from(kem_bytes).map_err(|_| {
+        EirnError::InvalidKeyLength {
+            expected: params.kem_pk_bytes,
+            actual: kem_bytes.len(),
+        }
+    })?;
+    EncapsulationKey768::new(&encoded).map_err(|_| EirnError::AuthenticationFailed)
+}
+
+fn parse_encapsulation_key_1024(data: &[u8], params: EirnParams) -> Result<EncapsulationKey1024> {
+    let kem_bytes = data
+        .get(..params.kem_pk_bytes)
+        .ok_or(EirnError::InvalidKeyLength {
+            expected: params.pk_bytes,
+            actual: data.len(),
+        })?;
+    let encoded = ml_kem::kem::Key::<EncapsulationKey1024>::try_from(kem_bytes).map_err(|_| {
+        EirnError::InvalidKeyLength {
+            expected: params.kem_pk_bytes,
+            actual: kem_bytes.len(),
+        }
+    })?;
+    EncapsulationKey1024::new(&encoded).map_err(|_| EirnError::AuthenticationFailed)
+}
+
+fn parse_ciphertext(data: &[u8], params: EirnParams) -> Result<()> {
+    match params {
+        PARAMS_768 => parse_ciphertext_768(data, params).map(|_| ()),
+        PARAMS_1024 => parse_ciphertext_1024(data, params).map(|_| ()),
+        _ => Err(EirnError::UnsupportedParameterSet { name: params.name }),
+    }
+}
+
+fn parse_ciphertext_768(data: &[u8], params: EirnParams) -> Result<MlKemCiphertext768> {
+    let encoded =
+        MlKemCiphertext768::try_from(data).map_err(|_| EirnError::InvalidCiphertextLength {
+            expected: params.ct_bytes,
+            actual: data.len(),
+        })?;
+    Ok(encoded)
+}
+
+fn parse_ciphertext_1024(data: &[u8], params: EirnParams) -> Result<MlKemCiphertext1024> {
+    let encoded =
+        MlKemCiphertext1024::try_from(data).map_err(|_| EirnError::InvalidCiphertextLength {
+            expected: params.ct_bytes,
+            actual: data.len(),
+        })?;
+    Ok(encoded)
+}
+
+fn parse_verifying_key(data: &[u8], params: EirnParams) -> Result<()> {
+    match params {
+        PARAMS_768 => {
+            let encoded = ml_dsa::EncodedVerifyingKey::<MlDsa65>::try_from(data).map_err(|_| {
+                EirnError::InvalidKeyLength {
+                    expected: params.sig_pk_bytes,
+                    actual: data.len(),
+                }
+            })?;
+            let _ = ml_dsa::VerifyingKey::<MlDsa65>::decode(&encoded);
+        }
+        PARAMS_1024 => {
+            let encoded = ml_dsa::EncodedVerifyingKey::<MlDsa87>::try_from(data).map_err(|_| {
+                EirnError::InvalidKeyLength {
+                    expected: params.sig_pk_bytes,
+                    actual: data.len(),
+                }
+            })?;
+            let _ = ml_dsa::VerifyingKey::<MlDsa87>::decode(&encoded);
+        }
+        _ => return Err(EirnError::UnsupportedParameterSet { name: params.name }),
+    }
+    Ok(())
+}
+
+fn parse_lattice_statement(data: &[u8], params: EirnParams) -> Result<()> {
+    let expected = params.kem_pk_bytes + params.sig_pk_bytes + params.zk_statement_bytes;
+    if data.len() != expected {
+        return Err(EirnError::InvalidKeyLength {
+            expected,
+            actual: data.len(),
+        });
+    }
+    lattice_zk::decode_statement(lattice_zk::statement_bytes_from_key(
+        data,
+        params.kem_pk_bytes,
+        params.sig_pk_bytes,
+    ))
+    .ok_or(EirnError::AuthenticationFailed)?;
+    Ok(())
 }

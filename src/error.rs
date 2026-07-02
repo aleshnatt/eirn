@@ -22,8 +22,10 @@ pub enum EirnError {
     InvalidKeyLength { expected: usize, actual: usize },
     /// Receiver state had no one-time prekey left to consume.
     NoOneTimePrekeys,
-    /// The caller requested a reserved strict KCP mode.
+    /// The caller requested an unknown or unsupported KCP mode.
     StrictModeUnavailable,
+    /// The caller selected a parameter profile not implemented by this crate.
+    UnsupportedParameterSet { name: &'static str },
 }
 
 impl fmt::Display for EirnError {
@@ -52,8 +54,9 @@ impl fmt::Display for EirnError {
                 write!(f, "invalid key length: expected {expected}, got {actual}")
             }
             EirnError::NoOneTimePrekeys => f.write_str("no one-time prekeys remaining"),
-            EirnError::StrictModeUnavailable => {
-                f.write_str("KCP strict lattice mode is not implemented in this crate version")
+            EirnError::StrictModeUnavailable => f.write_str("unsupported KCP mode"),
+            EirnError::UnsupportedParameterSet { name } => {
+                write!(f, "unsupported Eirn-KCP parameter set: {name}")
             }
         }
     }

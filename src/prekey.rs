@@ -10,7 +10,7 @@ use core::fmt;
 use crate::{
     error::{EirnError, Result},
     kem::{keygen_with_params, PublicKey, SecretKey},
-    params::{EirnParams, PARAMS_512},
+    params::{EirnParams, PARAMS_768},
     util::sha3_256,
 };
 
@@ -110,7 +110,7 @@ impl PrekeyBundle {
     }
 }
 
-/// Generates receiver prekey state under the default Eirn-512 profile.
+/// Generates receiver prekey state under the default ML-KEM-768 / ML-DSA-65 profile.
 ///
 /// # Randomness
 ///
@@ -122,7 +122,7 @@ impl PrekeyBundle {
 /// The returned bundle contains private receiver state. Publish only
 /// [`PrekeyBundle::public_bundle`].
 pub fn generate_prekey_bundle(num_opk: usize) -> PrekeyBundle {
-    generate_prekey_bundle_with_params(num_opk, PARAMS_512)
+    generate_prekey_bundle_with_params(num_opk, PARAMS_768)
 }
 
 /// Generates receiver prekey state under `params`.
@@ -148,8 +148,11 @@ pub fn generate_prekey_bundle_with_params(num_opk: usize, params: EirnParams) ->
         one_time_secret_keys.push(sk);
     }
 
-    let mut commitment_input = Vec::with_capacity(32 + 32 + PREKEY_COMMIT_LABEL.len());
-    commitment_input.extend_from_slice(signed_prekey_sk.seed());
+    let commitment_secret = signed_prekey_sk.commitment_secret();
+    let mut commitment_input = Vec::with_capacity(
+        commitment_secret.len() + signed_prekey_pk.as_bytes().len() + PREKEY_COMMIT_LABEL.len(),
+    );
+    commitment_input.extend_from_slice(&commitment_secret);
     commitment_input.extend_from_slice(signed_prekey_pk.as_bytes());
     commitment_input.extend_from_slice(PREKEY_COMMIT_LABEL);
     let commitment = sha3_256(&commitment_input);

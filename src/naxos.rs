@@ -1,19 +1,17 @@
 //! NAXOS-style sender-bound encapsulation helpers.
 //!
-//! This module derives deterministic encapsulation coins from sender identity
-//! and ephemeral secrets before wrapping the KEM shared secret into the
-//! handshake transcript. It is intended to resist sender key-compromise
-//! impersonation within the modeled Eirn-KCP flow. It does not make the
-//! underlying hash-based KEM a standardized NAXOS construction.
+//! This module binds an ML-KEM shared secret to sender and receiver public keys
+//! plus the handshake transcript. ML-KEM randomness remains internal to the
+//! standardized encapsulation operation.
 
 use crate::{
-    kem::{decaps, encaps_deterministic, Ciphertext, PublicKey, SecretKey},
+    kem::{decaps, encaps, Ciphertext, PublicKey, SecretKey},
     util::sha3_256,
 };
 
 const NAXOS_LABEL: &[u8] = b"eirn-naxos-v1";
 
-/// Derives deterministic encapsulation coins for the sender-bound KEM leg.
+/// Derives sender-bound transcript material for the NAXOS-style KDF leg.
 ///
 /// # Security
 ///
@@ -26,17 +24,24 @@ pub fn naxos_derive_coins(
     recipient_pk: &PublicKey,
     context: &[u8],
 ) -> [u8; 32] {
-    let hashed_ephemeral_secret = sha3_256(sender_ephemeral_sk.seed());
-    let mut coin_input = Vec::with_capacity(32 + 32 + 32 + context.len() + NAXOS_LABEL.len());
-    coin_input.extend_from_slice(sender_sk.seed());
-    coin_input.extend_from_slice(&hashed_ephemeral_secret);
+    let sender_secret = sender_sk.commitment_secret();
+    let ephemeral_secret = sender_ephemeral_sk.commitment_secret();
+    let mut coin_input = Vec::with_capacity(
+        sender_secret.len()
+            + ephemeral_secret.len()
+            + recipient_pk.as_bytes().len()
+            + context.len()
+            + NAXOS_LABEL.len(),
+    );
+    coin_input.extend_from_slice(&sender_secret);
+    coin_input.extend_from_slice(&ephemeral_secret);
     coin_input.extend_from_slice(recipient_pk.as_bytes());
     coin_input.extend_from_slice(context);
     coin_input.extend_from_slice(NAXOS_LABEL);
     sha3_256(&coin_input)
 }
 
-/// Encapsulates to `recipient_pk` with coins derived from sender secrets.
+/// Encapsulates to `recipient_pk` and binds the result to sender context.
 ///
 /// # Security
 ///
@@ -46,12 +51,16 @@ pub fn naxos_derive_coins(
 pub fn naxos_encaps(
     recipient_pk: &PublicKey,
     sender_sk: &SecretKey,
-    sender_ephemeral_sk: &SecretKey,
+    _sender_ephemeral_sk: &SecretKey,
     context: &[u8],
 ) -> (Ciphertext, [u8; 32]) {
-    let coins = naxos_derive_coins(sender_sk, sender_ephemeral_sk, recipient_pk, context);
-    let (ct, ss_raw) = encaps_deterministic(recipient_pk, &coins);
-    let mut ss_input = Vec::with_capacity(8 + 32 + 32 + 32 + context.len());
+    let (ct, ss_raw) = encaps(recipient_pk);
+    let mut ss_input = Vec::with_capacity(
+        8 + ss_raw.len()
+            + sender_sk.public_key_bytes().len()
+            + recipient_pk.as_bytes().len()
+            + context.len(),
+    );
     ss_input.extend_from_slice(b"naxos-ss");
     ss_input.extend_from_slice(&ss_raw);
     ss_input.extend_from_slice(sender_sk.public_key_bytes());
@@ -74,7 +83,12 @@ pub fn naxos_decaps(
     context: &[u8],
 ) -> [u8; 32] {
     let ss_raw = decaps(recipient_sk, ct);
-    let mut ss_input = Vec::with_capacity(8 + 32 + 32 + 32 + context.len());
+    let mut ss_input = Vec::with_capacity(
+        8 + ss_raw.len()
+            + sender_pk.as_bytes().len()
+            + recipient_sk.public_key_bytes().len()
+            + context.len(),
+    );
     ss_input.extend_from_slice(b"naxos-ss");
     ss_input.extend_from_slice(&ss_raw);
     ss_input.extend_from_slice(sender_pk.as_bytes());

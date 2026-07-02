@@ -8,21 +8,24 @@
 
 use crate::{
     error::{EirnError, Result},
-    kem::{decaps, encaps, keygen, Ciphertext, PublicKey},
+    kem::{decaps, encaps, Ciphertext, PublicKey},
     naxos::{naxos_decaps, naxos_encaps},
     prekey::{PrekeyBundle, PublicPrekeyBundle},
     session::derive_session_key,
-    zk::{kcp_lite_prove_for_key, kcp_lite_verify, KcpLiteProof, KcpMode},
+    zk::{
+        kcp_lite_prove_for_key, kcp_lite_verify, kcp_strict_prove, kcp_strict_verify, KcpLiteProof,
+        KcpMode, KcpStrictProof,
+    },
 };
 
 /// Initial sender message for the asynchronous Eirn-KCP handshake.
 ///
 /// The message carries the sender identity key, sender ephemeral key, four
-/// ciphertexts with distinct binding roles, and a KCP-Lite proof tying the
-/// sender identity to the session context. Verifying the message authenticates
-/// the sender only if the sender public key is expected by the caller. Callers
-/// must reject unauthenticated receiver bundles and must not reuse consumed
-/// one-time prekeys.
+/// ciphertexts with distinct binding roles, and either a KCP-Lite or KCP-Strict
+/// proof tying the sender identity to the session context. Verifying the
+/// message authenticates the sender only if the sender public key is expected
+/// by the caller. Callers must reject unauthenticated receiver bundles and must
+/// not reuse consumed one-time prekeys.
 #[derive(Clone, Debug)]
 pub struct Msg0Prime {
     pub pk_a: PublicKey,
@@ -33,10 +36,11 @@ pub struct Msg0Prime {
     pub ct4: Ciphertext,
     pub kcp_mode: KcpMode,
     pub kcp_lite_proof: KcpLiteProof,
+    pub kcp_strict_proof: Option<KcpStrictProof>,
 }
 
 impl Msg0Prime {
-    /// Fixed encoded `MSG0'` size in bytes.
+    /// Fixed encoded `MSG0'` size in bytes for the default profile.
     pub const SIZE: usize = 1 + PublicKey::SIZE * 2 + Ciphertext::SIZE * 4 + KcpLiteProof::SIZE;
 
     /// Returns the fixed encoded size for this message.
@@ -44,9 +48,10 @@ impl Msg0Prime {
     /// # Security
     ///
     /// The size is structural metadata only. Callers must still verify the
-    /// KCP-Lite proof and derive the session key before accepting a message.
+    /// selected proof mode and derive the session key before accepting a
+    /// message.
     pub fn total_size(&self) -> usize {
-        Self::SIZE
+        msg0_size(self.pk_a.params(), self.kcp_mode)
     }
 
     /// Serializes the message to its fixed-size wire encoding.
@@ -56,18 +61,26 @@ impl Msg0Prime {
     /// Serialization does not authenticate the message. Receivers must run
     /// [`receiver_handshake`] or equivalent proof verification before using
     /// derived keys.
-    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
-        let mut out = [0u8; Self::SIZE];
-        out[0] = self.kcp_mode as u8;
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total_size());
+        out.push(self.kcp_mode as u8);
 
-        let mut offset = 1;
-        write_field(&mut out, &mut offset, self.pk_a.as_bytes());
-        write_field(&mut out, &mut offset, self.ek_a.as_bytes());
-        write_field(&mut out, &mut offset, self.ct1.as_bytes());
-        write_field(&mut out, &mut offset, self.ct2.as_bytes());
-        write_field(&mut out, &mut offset, self.ct3.as_bytes());
-        write_field(&mut out, &mut offset, self.ct4.as_bytes());
-        write_field(&mut out, &mut offset, &self.kcp_lite_proof.to_bytes());
+        write_field(&mut out, self.pk_a.as_bytes());
+        write_field(&mut out, self.ek_a.as_bytes());
+        write_field(&mut out, self.ct1.as_bytes());
+        write_field(&mut out, self.ct2.as_bytes());
+        write_field(&mut out, self.ct3.as_bytes());
+        write_field(&mut out, self.ct4.as_bytes());
+        match self.kcp_mode {
+            KcpMode::Lite => write_field(&mut out, &self.kcp_lite_proof.to_bytes()),
+            KcpMode::Strict => {
+                let proof = self
+                    .kcp_strict_proof
+                    .as_ref()
+                    .expect("strict messages carry a strict proof");
+                write_field(&mut out, &proof.to_bytes());
+            }
+        }
         out
     }
 
@@ -76,8 +89,8 @@ impl Msg0Prime {
     /// # Errors
     ///
     /// Returns [`EirnError::InvalidMessageLength`] if `data` has the wrong
-    /// length, [`EirnError::StrictModeUnavailable`] if the mode byte requests
-    /// strict KCP, or a key, ciphertext, or proof length error if a field fails
+    /// length, [`EirnError::StrictModeUnavailable`] if the mode byte is
+    /// unknown, or a key, ciphertext, or proof length error if a field fails
     /// structural parsing.
     ///
     /// # Untrusted Input
@@ -92,7 +105,7 @@ impl Msg0Prime {
     /// Callers must pass the result to [`receiver_handshake`] before accepting
     /// the transcript.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        Self::from_bytes_with_params(data, crate::params::PARAMS_512)
+        Self::from_bytes_with_params(data, crate::params::PARAMS_768)
     }
 
     /// Parses a message from its fixed-size wire encoding under `params`.
@@ -100,8 +113,8 @@ impl Msg0Prime {
     /// # Errors
     ///
     /// Returns [`EirnError::InvalidMessageLength`] if `data` has the wrong
-    /// length, [`EirnError::StrictModeUnavailable`] if the mode byte requests
-    /// strict KCP, or a key, ciphertext, or proof length error if a field fails
+    /// length, [`EirnError::StrictModeUnavailable`] if the mode byte is
+    /// unknown, or a key, ciphertext, or proof length error if a field fails
     /// structural parsing.
     ///
     /// # Untrusted Input
@@ -115,40 +128,67 @@ impl Msg0Prime {
     /// The caller must supply the same parameter profile expected for the peer
     /// bundle. Successful parsing is not proof verification.
     pub fn from_bytes_with_params(data: &[u8], params: crate::params::EirnParams) -> Result<Self> {
-        if data.len() != Self::SIZE {
+        let mode = match data.first().copied() {
+            Some(byte) if byte == KcpMode::Lite as u8 => KcpMode::Lite,
+            Some(byte) if byte == KcpMode::Strict as u8 => KcpMode::Strict,
+            Some(_) => return Err(EirnError::StrictModeUnavailable),
+            None => {
+                return Err(EirnError::InvalidMessageLength {
+                    expected: 1,
+                    actual: 0,
+                })
+            }
+        };
+        let expected_size = msg0_size(params, mode);
+        if data.len() != expected_size {
             return Err(EirnError::InvalidMessageLength {
-                expected: Self::SIZE,
+                expected: expected_size,
                 actual: data.len(),
             });
         }
 
-        if data[0] != KcpMode::Lite as u8 {
-            return Err(EirnError::StrictModeUnavailable);
-        }
-
         let mut offset = 1;
-        let pk_a =
-            PublicKey::from_bytes(read_field::<{ PublicKey::SIZE }>(data, &mut offset), params)?;
-        let ek_a =
-            PublicKey::from_bytes(read_field::<{ PublicKey::SIZE }>(data, &mut offset), params)?;
+        let pk_a = PublicKey::from_bytes(
+            read_dynamic_field(data, &mut offset, params.pk_bytes),
+            params,
+        )?;
+        let ek_a = PublicKey::from_bytes(
+            read_dynamic_field(data, &mut offset, params.pk_bytes),
+            params,
+        )?;
         let ct1 = Ciphertext::from_bytes(
-            read_field::<{ Ciphertext::SIZE }>(data, &mut offset),
+            read_dynamic_field(data, &mut offset, params.ct_bytes),
             params,
         )?;
         let ct2 = Ciphertext::from_bytes(
-            read_field::<{ Ciphertext::SIZE }>(data, &mut offset),
+            read_dynamic_field(data, &mut offset, params.ct_bytes),
             params,
         )?;
         let ct3 = Ciphertext::from_bytes(
-            read_field::<{ Ciphertext::SIZE }>(data, &mut offset),
+            read_dynamic_field(data, &mut offset, params.ct_bytes),
             params,
         )?;
         let ct4 = Ciphertext::from_bytes(
-            read_field::<{ Ciphertext::SIZE }>(data, &mut offset),
+            read_dynamic_field(data, &mut offset, params.ct_bytes),
             params,
         )?;
-        let kcp_lite_proof =
-            KcpLiteProof::from_bytes(read_field::<{ KcpLiteProof::SIZE }>(data, &mut offset))?;
+        let (kcp_lite_proof, kcp_strict_proof) = match mode {
+            KcpMode::Lite => (
+                KcpLiteProof::from_bytes_with_params(
+                    read_dynamic_field(data, &mut offset, params.proof_bytes),
+                    params,
+                )?,
+                None,
+            ),
+            KcpMode::Strict => (
+                empty_lite_proof(params),
+                Some(KcpStrictProof::from_bytes(read_dynamic_field(
+                    data,
+                    &mut offset,
+                    params.strict_proof_bytes,
+                ))?),
+            ),
+        };
 
         Ok(Self {
             pk_a,
@@ -157,13 +197,14 @@ impl Msg0Prime {
             ct2,
             ct3,
             ct4,
-            kcp_mode: KcpMode::Lite,
+            kcp_mode: mode,
             kcp_lite_proof,
+            kcp_strict_proof,
         })
     }
 }
 
-/// Builds the KCP-Lite session context from sender, receiver, and ephemeral keys.
+/// Builds the KCP session context from sender, receiver, and ephemeral keys.
 ///
 /// # Security
 ///
@@ -171,7 +212,8 @@ impl Msg0Prime {
 /// identity key and `ek_a` is fresh for the session. Reusing `ek_a` weakens
 /// replay separation across handshakes.
 pub fn build_context(pk_a: &PublicKey, pk_b: &PublicKey, ek_a: &PublicKey) -> Vec<u8> {
-    let mut ctx = Vec::with_capacity(96);
+    let mut ctx =
+        Vec::with_capacity(pk_a.as_bytes().len() + pk_b.as_bytes().len() + ek_a.as_bytes().len());
     ctx.extend_from_slice(pk_a.as_bytes());
     ctx.extend_from_slice(pk_b.as_bytes());
     ctx.extend_from_slice(ek_a.as_bytes());
@@ -184,8 +226,8 @@ pub fn build_context(pk_a: &PublicKey, pk_b: &PublicKey, ek_a: &PublicKey) -> Ve
 ///
 /// Returns [`EirnError::KeyMismatch`] if `sk_a` does not own `pk_a`.
 /// Returns [`EirnError::NoOneTimePrekeys`] if `bundle_b` has no public one-time
-/// prekey. Returns [`EirnError::KeyMismatch`] from KCP-Lite proof generation if
-/// the key relationship fails during proof construction.
+/// prekey. Returns [`EirnError::KeyMismatch`] from proof generation if the key
+/// relationship fails during proof construction.
 ///
 /// # Security
 ///
@@ -198,16 +240,42 @@ pub fn sender_handshake(
     pk_a: &PublicKey,
     bundle_b: &PublicPrekeyBundle,
 ) -> Result<(Msg0Prime, [u8; 32])> {
+    sender_handshake_with_mode(sk_a, pk_a, bundle_b, KcpMode::Lite)
+}
+
+/// Creates the sender's initial message with a KCP-Strict lattice-native proof.
+pub fn sender_handshake_strict(
+    sk_a: &crate::kem::SecretKey,
+    pk_a: &PublicKey,
+    bundle_b: &PublicPrekeyBundle,
+) -> Result<(Msg0Prime, [u8; 32])> {
+    sender_handshake_with_mode(sk_a, pk_a, bundle_b, KcpMode::Strict)
+}
+
+fn sender_handshake_with_mode(
+    sk_a: &crate::kem::SecretKey,
+    pk_a: &PublicKey,
+    bundle_b: &PublicPrekeyBundle,
+    mode: KcpMode,
+) -> Result<(Msg0Prime, [u8; 32])> {
     if !sk_a.matches_public_key(pk_a) {
         return Err(EirnError::KeyMismatch);
     }
 
-    let (ek_a, esk_a) = keygen();
+    let params = bundle_b.identity_pk.params();
+    if pk_a.params() != params || bundle_b.signed_prekey_pk.params() != params {
+        return Err(EirnError::KeyMismatch);
+    }
+
+    let (ek_a, esk_a) = crate::kem::keygen_with_params(params);
     let opk_b = bundle_b
         .one_time_prekeys
         .first()
         .ok_or(EirnError::NoOneTimePrekeys)?
         .clone();
+    if opk_b.params() != params {
+        return Err(EirnError::KeyMismatch);
+    }
     let ctx = build_context(pk_a, &bundle_b.identity_pk, &ek_a);
 
     // ct1 binds the session to the receiver identity key.
@@ -219,13 +287,19 @@ pub fn sender_handshake(
     // ct4 adds NAXOS-style sender identity and ephemeral entropy.
     let (ct4, k4) = naxos_encaps(&bundle_b.signed_prekey_pk, sk_a, &esk_a, &ctx);
 
-    let proof = kcp_lite_prove_for_key(sk_a, pk_a, &ctx)?;
+    let (kcp_lite_proof, kcp_strict_proof) = match mode {
+        KcpMode::Lite => (kcp_lite_prove_for_key(sk_a, pk_a, &ctx)?, None),
+        KcpMode::Strict => (
+            empty_lite_proof(params),
+            Some(kcp_strict_prove(sk_a, pk_a, &ctx)?),
+        ),
+    };
     let secrets = [k1, k2, k3, k4];
     let ciphertexts = [
-        ct1.as_bytes().as_slice(),
-        ct2.as_bytes().as_slice(),
-        ct3.as_bytes().as_slice(),
-        ct4.as_bytes().as_slice(),
+        ct1.as_bytes(),
+        ct2.as_bytes(),
+        ct3.as_bytes(),
+        ct4.as_bytes(),
     ];
     let ss = derive_session_key(
         &secrets,
@@ -244,32 +318,47 @@ pub fn sender_handshake(
             ct2,
             ct3,
             ct4,
-            kcp_mode: KcpMode::Lite,
-            kcp_lite_proof: proof,
+            kcp_mode: mode,
+            kcp_lite_proof,
+            kcp_strict_proof,
         },
         ss,
     ))
 }
 
-fn write_field<const N: usize>(out: &mut [u8], offset: &mut usize, field: &[u8; N]) {
-    out[*offset..*offset + N].copy_from_slice(field);
-    *offset += N;
+fn write_field(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(field);
 }
 
-fn read_field<'a, const N: usize>(data: &'a [u8], offset: &mut usize) -> &'a [u8] {
-    let field = &data[*offset..*offset + N];
-    *offset += N;
+fn read_dynamic_field<'a>(data: &'a [u8], offset: &mut usize, len: usize) -> &'a [u8] {
+    let field = &data[*offset..*offset + len];
+    *offset += len;
     field
+}
+
+fn msg0_size(params: crate::params::EirnParams, mode: KcpMode) -> usize {
+    let proof_size = match mode {
+        KcpMode::Lite => params.proof_bytes,
+        KcpMode::Strict => params.strict_proof_bytes,
+    };
+    1 + params.pk_bytes * 2 + params.ct_bytes * 4 + proof_size
+}
+
+fn empty_lite_proof(params: crate::params::EirnParams) -> KcpLiteProof {
+    KcpLiteProof {
+        commitment: [0u8; 32],
+        response: vec![0u8; params.sig_bytes],
+        anchor: [0u8; 32],
+    }
 }
 
 /// Verifies `msg0`, consumes one one-time prekey, and derives the receiver key.
 ///
 /// # Errors
 ///
-/// Returns [`EirnError::StrictModeUnavailable`] if the message requests strict
-/// KCP, [`EirnError::AuthenticationFailed`] if the KCP-Lite proof fails, or
-/// [`EirnError::NoOneTimePrekeys`] if receiver state has no one-time prekey to
-/// consume.
+/// Returns [`EirnError::AuthenticationFailed`] if the selected proof fails, or
+/// [`EirnError::NoOneTimePrekeys`] if receiver state has no one-time prekey left
+/// to consume.
 ///
 /// # Security
 ///
@@ -277,13 +366,33 @@ fn read_field<'a, const N: usize>(data: &'a [u8], offset: &mut usize) -> &'a [u8
 /// reused after its one-time prekey pool is depleted. A returned key is valid
 /// only for the transcript represented by `msg0`.
 pub fn receiver_handshake(bundle_b: &mut PrekeyBundle, msg0: &Msg0Prime) -> Result<[u8; 32]> {
-    if msg0.kcp_mode != KcpMode::Lite {
-        return Err(EirnError::StrictModeUnavailable);
+    let params = bundle_b.identity_pk.params();
+    if msg0.pk_a.params() != params
+        || msg0.ek_a.params() != params
+        || msg0.ct1.params() != params
+        || msg0.ct2.params() != params
+        || msg0.ct3.params() != params
+        || msg0.ct4.params() != params
+    {
+        return Err(EirnError::KeyMismatch);
     }
 
     let ctx = build_context(&msg0.pk_a, &bundle_b.identity_pk, &msg0.ek_a);
-    if !kcp_lite_verify(msg0.pk_a.as_bytes(), &ctx, &msg0.kcp_lite_proof) {
-        return Err(EirnError::AuthenticationFailed);
+    match msg0.kcp_mode {
+        KcpMode::Lite => {
+            if !kcp_lite_verify(msg0.pk_a.as_bytes(), &ctx, &msg0.kcp_lite_proof) {
+                return Err(EirnError::AuthenticationFailed);
+            }
+        }
+        KcpMode::Strict => {
+            let proof = msg0
+                .kcp_strict_proof
+                .as_ref()
+                .ok_or(EirnError::AuthenticationFailed)?;
+            if !kcp_strict_verify(&msg0.pk_a, &ctx, proof) {
+                return Err(EirnError::AuthenticationFailed);
+            }
+        }
     }
 
     let (_, opk_sk) = bundle_b.consume_opk()?;
@@ -294,10 +403,10 @@ pub fn receiver_handshake(bundle_b: &mut PrekeyBundle, msg0: &Msg0Prime) -> Resu
 
     let secrets = [k1, k2, k3, k4];
     let ciphertexts = [
-        msg0.ct1.as_bytes().as_slice(),
-        msg0.ct2.as_bytes().as_slice(),
-        msg0.ct3.as_bytes().as_slice(),
-        msg0.ct4.as_bytes().as_slice(),
+        msg0.ct1.as_bytes(),
+        msg0.ct2.as_bytes(),
+        msg0.ct3.as_bytes(),
+        msg0.ct4.as_bytes(),
     ];
     Ok(derive_session_key(
         &secrets,
