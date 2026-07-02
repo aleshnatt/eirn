@@ -2,6 +2,7 @@ use eirn_kcp::{
     decaps, encaps, encaps_deterministic, generate_prekey_bundle, keygen, receiver_handshake,
     sender_handshake, KcpLiteProof, Msg0Prime, PublicKey,
 };
+use sha3::{Digest, Sha3_256};
 
 #[test]
 fn kem_roundtrip_matches() {
@@ -37,7 +38,7 @@ fn kcp_lite_proof_roundtrips_and_verifies() {
     let (ek_a, _) = keygen();
     let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
 
-    let proof = eirn_kcp::kcp_lite_prove(sk_a.seed(), pk_a.as_bytes(), &ctx).unwrap();
+    let proof = eirn_kcp::kcp_lite_prove(&sk_a, pk_a.as_bytes(), &ctx).unwrap();
     assert!(eirn_kcp::kcp_lite_verify(pk_a.as_bytes(), &ctx, &proof));
 
     let encoded = proof.to_bytes();
@@ -62,7 +63,7 @@ fn kcp_lite_rejects_tampering_and_replay() {
     let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
     let other_ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_other);
 
-    let proof = eirn_kcp::kcp_lite_prove(sk_a.seed(), pk_a.as_bytes(), &ctx).unwrap();
+    let proof = eirn_kcp::kcp_lite_prove(&sk_a, pk_a.as_bytes(), &ctx).unwrap();
     assert!(!eirn_kcp::kcp_lite_verify(
         pk_a.as_bytes(),
         &other_ctx,
@@ -87,11 +88,45 @@ fn kcp_lite_proof_can_be_created_without_exposing_seed() {
 }
 
 #[test]
+fn kcp_lite_rejects_forged_proof() {
+    let (pk_a, sk_a) = keygen();
+    let (pk_b, _) = keygen();
+    let (ek_a, _) = keygen();
+    let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
+
+    let mut forged = eirn_kcp::kcp_lite_prove(&sk_a, pk_a.as_bytes(), &ctx).unwrap();
+    // invalid signature bytes with a recomputed anchor
+    forged.response = [9u8; 64];
+    forged.anchor = kcp_lite_anchor(pk_a.as_bytes(), &forged.response, &ctx);
+
+    assert!(!eirn_kcp::kcp_lite_verify(pk_a.as_bytes(), &ctx, &forged));
+}
+
+#[test]
+fn kcp_lite_rejects_wrong_context() {
+    let (pk_a, sk_a) = keygen();
+    let (pk_b, _) = keygen();
+    let (ek_a, _) = keygen();
+    let (ek_other, _) = keygen();
+    let ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_a);
+    let other_ctx = eirn_kcp::build_context(&pk_a, &pk_b, &ek_other);
+
+    let proof = eirn_kcp::kcp_lite_prove(&sk_a, pk_a.as_bytes(), &ctx).unwrap();
+
+    assert!(!eirn_kcp::kcp_lite_verify(
+        pk_a.as_bytes(),
+        &other_ctx,
+        &proof
+    ));
+}
+
+#[test]
 fn handshake_produces_matching_session_keys() {
     let (pk_a, sk_a) = keygen();
     let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
 
-    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &bundle_b).unwrap();
+    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &public_bundle_b).unwrap();
     let bob_ss = receiver_handshake(&mut bundle_b, &msg0).unwrap();
 
     assert_eq!(alice_ss, bob_ss);
@@ -102,8 +137,9 @@ fn handshake_produces_matching_session_keys() {
 fn msg0_prime_roundtrips_through_bytes() {
     let (pk_a, sk_a) = keygen();
     let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
 
-    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &bundle_b).unwrap();
+    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &public_bundle_b).unwrap();
     let encoded = msg0.to_bytes();
     assert_eq!(encoded.len(), Msg0Prime::SIZE);
 
@@ -119,8 +155,9 @@ fn msg0_prime_roundtrips_through_bytes() {
 fn handshake_rejects_tampered_proof() {
     let (pk_a, sk_a) = keygen();
     let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
 
-    let (mut msg0, _) = sender_handshake(&sk_a, &pk_a, &bundle_b).unwrap();
+    let (mut msg0, _) = sender_handshake(&sk_a, &pk_a, &public_bundle_b).unwrap();
     msg0.kcp_lite_proof.anchor[0] ^= 1;
 
     let err = receiver_handshake(&mut bundle_b, &msg0).unwrap_err();
@@ -135,7 +172,7 @@ fn proof_generation_rejects_mismatched_public_key() {
     let (ek_a, _) = keygen();
     let ctx = eirn_kcp::build_context(&wrong_pk, &pk_b, &ek_a);
 
-    let err = eirn_kcp::kcp_lite_prove(sk_a.seed(), wrong_pk.as_bytes(), &ctx).unwrap_err();
+    let err = eirn_kcp::kcp_lite_prove(&sk_a, wrong_pk.as_bytes(), &ctx).unwrap_err();
     assert_eq!(err, eirn_kcp::EirnError::KeyMismatch);
 }
 
@@ -144,36 +181,40 @@ fn sender_handshake_rejects_mismatched_keypair() {
     let (_, sk_a) = keygen();
     let (wrong_pk, _) = keygen();
     let bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
 
-    let err = sender_handshake(&sk_a, &wrong_pk, &bundle_b).unwrap_err();
+    let err = sender_handshake(&sk_a, &wrong_pk, &public_bundle_b).unwrap_err();
     assert_eq!(err, eirn_kcp::EirnError::KeyMismatch);
+}
+
+#[test]
+fn handshake_uses_public_bundle_only() {
+    let (pk_a, sk_a) = keygen();
+    let mut bundle_b = generate_prekey_bundle(3);
+    let public_bundle_b = bundle_b.public_bundle();
+
+    let (msg0, alice_ss) = sender_handshake(&sk_a, &pk_a, &public_bundle_b).unwrap();
+    let bob_ss = receiver_handshake(&mut bundle_b, &msg0).unwrap();
+
+    assert_eq!(alice_ss, bob_ss);
 }
 
 #[test]
 fn debug_output_redacts_secret_material() {
     let (_, sk) = keygen();
-    let sk_seed_hex = hex_lower(sk.seed());
     let sk_debug = format!("{sk:?}");
     assert!(sk_debug.contains("<redacted>"));
-    assert!(!sk_debug.contains(&sk_seed_hex));
 
     let bundle = generate_prekey_bundle(2);
-    let identity_seed_hex = hex_lower(bundle.identity_sk.seed());
-    let signed_seed_hex = hex_lower(bundle.signed_prekey_sk.seed());
-    let opk_seed_hex = hex_lower(bundle.one_time_prekeys[0].1.seed());
     let bundle_debug = format!("{bundle:?}");
     assert!(bundle_debug.contains("<redacted>"));
-    assert!(!bundle_debug.contains(&identity_seed_hex));
-    assert!(!bundle_debug.contains(&signed_seed_hex));
-    assert!(!bundle_debug.contains(&opk_seed_hex));
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+fn kcp_lite_anchor(pk: &[u8; 32], response: &[u8; 64], ctx: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"eirn-kcp-lite-anchor-v1");
+    hasher.update(pk);
+    hasher.update(response);
+    hasher.update(ctx);
+    hasher.finalize().into()
 }

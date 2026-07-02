@@ -1,58 +1,56 @@
 # Eirn-KCP
 
-Rust implementation of Eirn-KCP protocol components:
+Eirn-KCP is a Rust crate for modeling an asynchronous key exchange flow with prekey bundles, transcript-bound session keys, and explicit key consistency checks.
 
-- Eirn KEM simulation with FO-style implicit rejection
-- KCP-Lite key consistency proof
-- NAXOS-derived encapsulation coins
-- Prekey bundle generation and one-time prekey consumption
-- Transcript-bound session and message KDFs
-- MSG0' sender and receiver handshake helpers
+[![Crates.io](https://img.shields.io/crates/v/eirn-kcp.svg)](https://crates.io/crates/eirn-kcp) [![docs.rs](https://docs.rs/eirn-kcp/badge.svg)](https://docs.rs/eirn-kcp) [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-This crate is the canonical Rust library implementation for the current
-prototype.
+## What This Crate Does
 
-## Install
+This crate packages the core Eirn-KCP handshake surface as a Rust library. A receiver creates a private prekey bundle and publishes only the public half; a sender uses that public bundle to build a fixed-size initial message and derive a session key. The receiver verifies the message, consumes one one-time prekey, and derives the matching session key from its private state.
 
-```toml
-[dependencies]
-eirn-kcp = "0.1"
-```
+The protocol model combines a crate-specific hash-based encapsulation path, a NAXOS-style sender-bound encapsulation leg, and KCP-Lite key consistency proof. KCP-Lite is implemented with Ed25519 signatures over the session context plus an anchor hash; it is a consistency check, not a formal zero-knowledge proof system.
 
-## Example
+The library is intended for protocol experimentation, test vectors, and implementation review of the Eirn-KCP message flow. It gives reviewers concrete Rust APIs for key generation, prekey handling, message encoding, proof verification, and transcript-bound key derivation.
+
+## Security Notice
+
+Known limitations:
+- KCP-Lite uses Ed25519 signatures and an anchor hash; it is not a formal zero-knowledge proof system.
+- Strict lattice-native KCP mode is reserved but not implemented.
+
+## Quick Start
 
 ```rust
 use eirn_kcp::{generate_prekey_bundle, keygen, receiver_handshake, sender_handshake};
 
-let (alice_pk, alice_sk) = keygen();
-let mut bob_bundle = generate_prekey_bundle(10);
+fn main() -> Result<(), eirn_kcp::EirnError> {
+    let (alice_pk, alice_sk) = keygen();
+    let mut bob_bundle = generate_prekey_bundle(10);
+    let bob_public = bob_bundle.public_bundle();
 
-let (msg0, alice_session_key) = sender_handshake(&alice_sk, &alice_pk, &bob_bundle)?;
-let bob_session_key = receiver_handshake(&mut bob_bundle, &msg0)?;
+    let (msg0, alice_key) = sender_handshake(&alice_sk, &alice_pk, &bob_public)?;
+    let bob_key = receiver_handshake(&mut bob_bundle, &msg0)?;
 
-assert_eq!(alice_session_key, bob_session_key);
-# Ok::<(), eirn_kcp::EirnError>(())
+    assert_eq!(alice_key, bob_key);
+    Ok(())
+}
 ```
 
-## Security Status
+## Parameter Sets
 
-This crate is suitable for protocol experimentation and integration tests. The
-KEM is a hash-based simulation that preserves the intended interface, not an
-audited MLWE KEM. KCP-Lite provides context-bound wrong-key detection for the
-prototype threat model; strict lattice ZKPoK mode is not implemented in this
-release and returns an explicit error instead of panicking.
+| Name | Security Target | Key Fields |
+| --- | --- | --- |
+| Eirn-512 | targets an Eirn-512 profile, without audited security-bit guarantees | `n = 256`, `k = 2`, `q = 3329`, 32-byte keys, 64-byte ciphertexts |
+| Eirn-768 | targets an Eirn-768 profile, without audited security-bit guarantees | `n = 256`, `k = 3`, `q = 3329`, 32-byte keys, 64-byte ciphertexts |
 
-Do not use this crate as a production cryptographic primitive without replacing
-the simulated KEM and proof layer with audited implementations.
-
-## Development
+## Building and Testing
 
 ```bash
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo package --allow-dirty --list
+cargo build --release
+cargo test --all-features
+cargo test --doc
 ```
 
 ## License
 
-MIT
+MIT OR Apache-2.0.

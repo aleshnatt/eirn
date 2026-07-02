@@ -1,3 +1,16 @@
+//! Parameter metadata for Eirn-KCP protocol profiles.
+//!
+//! These values describe byte sizes and nominal lattice-style profile names used
+//! by the crate APIs. They do not turn the hash-based KEM in this implementation
+//! into a standardized lattice KEM. Callers must treat the fields as protocol
+//! configuration metadata, not independent security proofs.
+
+/// Public parameter metadata attached to keys and ciphertexts.
+///
+/// The type records the protocol profile and fixed byte sizes expected by the
+/// Eirn-KCP APIs. Matching parameters prevent accidental cross-profile use of
+/// keys and ciphertexts. Callers must not interpret `nist_level` as an audited
+/// security guarantee for this implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EirnParams {
     pub name: &'static str,
